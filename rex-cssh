@@ -126,6 +126,25 @@ def grid_shape(n):
     return [min(cols, n - r * cols) for r in range(rows)]
 
 
+def show_session(rex, session):
+    """Best effort: switch connected Rex apps to SESSION. True if one did."""
+    proc = subprocess.run([rex, "client", "ls", "--json"],
+                          capture_output=True, text=True)
+    try:
+        clients = json.loads(proc.stdout).get("clients", [])
+    except ValueError:
+        return False
+    shown = False
+    for client in clients:
+        if client.get("info", {}).get("kind") != "app":
+            continue
+        res = subprocess.run([rex, "-C", client["client_id"], "do",
+                              "session.select", f"session_id={session}"],
+                             capture_output=True)
+        shown = shown or res.returncode == 0
+    return shown
+
+
 def launch(args):
     rex = shutil.which("rex")
     if not rex:
@@ -209,10 +228,11 @@ def launch(args):
     os.replace(tmp, os.path.join(rdir, "state.json"))
 
     subprocess.run([rex, "focus", "-s", session, blocks[0]], capture_output=True)
-    where = f"session {session}" if created_session else "this session"
-    print(f"rex-cssh: opened {len(targets)} panes in {where} (tab '{label}')")
-    if created_session:
-        print("rex-cssh: select that session in the Rex app to use it.")
+    where = f"session '{label}' ({session})" if created_session else "this session"
+    print(f"rex-cssh: opened {len(targets)} panes in {where}")
+    if created_session and not show_session(rex, session):
+        print("rex-cssh: select that session in the Rex app to use it "
+              "(enable Remote Control in the app's Settings to switch automatically).")
 
 
 # --------------------------------------------------------------------------
@@ -386,7 +406,8 @@ def main():
     ap.add_argument("-t", "--tty", action="store_true", help="force a tty (-t) when using -x")
     ap.add_argument("-l", "--label", help="tab/session label (default cssh-<cluster|host>)")
     ap.add_argument("-n", "--new-session", action="store_true",
-                    help="create a new Rex session even when run inside one")
+                    help="open a new Rex session instead of a new tab "
+                         "(always the case outside Rex)")
     ap.add_argument("--ssh", default="ssh", help="ssh command to use (default: ssh)")
     ap.add_argument("-d", "--dry-run", action="store_true", help="print what would run")
     ap.add_argument("--pane", type=int, help=argparse.SUPPRESS)
