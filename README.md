@@ -97,8 +97,9 @@ internal mode) that:
 3. forwards them to the other wrappers over unix datagram sockets in a
    temporary directory under `/tmp`.
 
-Received keystrokes are written only to the local `ssh`, so nothing loops. The
-directory is removed when the last pane exits.
+Received keystrokes are written only to the local `ssh`, so nothing loops.
+The directory is removed when the last pane exits; if the session is killed
+from outside, a leftover directory is swept by the next run (after one hour).
 
 ## Limitations
 

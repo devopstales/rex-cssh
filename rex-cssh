@@ -39,6 +39,7 @@ import subprocess
 import sys
 import tempfile
 import termios
+import time
 import tty
 
 SELF = os.path.abspath(__file__)
@@ -169,6 +170,15 @@ def launch(args):
 
     # Rendezvous directory: one unix socket per pane, plus state.json.
     # (Under /tmp: unix socket paths have a short length limit.)
+    # Sweep rendezvous dirs left behind by killed or crashed sessions.
+    now = time.time()
+    for old in glob.glob("/tmp/rex-cssh-*"):
+        try:
+            if os.path.isdir(old) and now - os.stat(old).st_mtime > 3600:
+                shutil.rmtree(old, ignore_errors=True)
+        except OSError:
+            pass
+
     rdir = tempfile.mkdtemp(prefix="rex-cssh-", dir="/tmp")
 
     def pane_cmd(i):
@@ -201,6 +211,8 @@ def launch(args):
     # leader. Ratios keep every cell the same size.
     blocks = [None] * len(targets)
     blocks[0] = first
+    subprocess.run([rex, "block", "rename", "-s", session, first,
+                    targets[0][1]], capture_output=True)
     starts = [sum(shape[:r]) for r in range(len(shape))]
     for r in range(1, len(shape)):
         remaining = len(shape) - r + 1  # rows shared by the previous leader
@@ -259,6 +271,19 @@ def pane(idx, rdir, label, cmd):
         except OSError as exc:
             print(f"rex-cssh: cannot run {cmd[0]}: {exc}")
             os._exit(127)
+
+    def on_signal(sig, _frame):
+        # Session killed from outside: drop our socket, rmdir if we're last.
+        try:
+            os.unlink(my_sock)
+        except OSError:
+            pass
+        if not glob.glob(os.path.join(rdir, "*.sock")):
+            shutil.rmtree(rdir, ignore_errors=True)
+        os._exit(128 + sig)
+
+    signal.signal(signal.SIGTERM, on_signal)
+    signal.signal(signal.SIGHUP, on_signal)
 
     def sync_size(*_):
         try:
