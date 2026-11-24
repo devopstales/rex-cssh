@@ -1,0 +1,407 @@
+#!/usr/bin/env python3
+"""rex-cssh - cluster SSH for Rex (a tmux-cssh work-alike).
+
+Opens one Rex pane per host in a tiled grid, each running ssh. Whatever you
+type in ANY pane is replicated to all the others.
+
+Rex has no built-in "synchronize-panes", so every pane runs ssh through a tiny
+pty wrapper (this same script, `--pane`). The wrapper passes your keystrokes
+to its own ssh and forwards them to the sibling wrappers over unix sockets.
+
+Usage:
+  rex-cssh [options] [user@]host[:port] ...
+  rex-cssh -c CLUSTER [options]
+
+Keys (prefix is Ctrl-], typed in any pane):
+  Ctrl-] t   toggle broadcast on/off for all panes (pane labels show state)
+  Ctrl-] q   close all host panes
+  Ctrl-] ]   send a literal Ctrl-] to ssh
+
+Cluster file (default ~/.rex-cssh.conf, override with $REX_CSSH_CONF):
+  # name: host host user@host:port ...
+  web: web1 web2 web3
+  db:  admin@db1 admin@db2:2222
+"""
+
+import argparse
+import fcntl
+import glob
+import json
+import math
+import os
+import pty
+import select
+import shlex
+import shutil
+import signal
+import socket
+import subprocess
+import sys
+import tempfile
+import termios
+import tty
+
+SELF = os.path.abspath(__file__)
+PREFIX = b"\x1d"  # Ctrl-]
+CHUNK = 1024      # unix datagrams are small; split big pastes
+
+
+# --------------------------------------------------------------------------
+# launcher
+# --------------------------------------------------------------------------
+
+def die(msg, code=1):
+    print(f"rex-cssh: {msg}", file=sys.stderr)
+    sys.exit(code)
+
+
+def rex_json(rex, *args):
+    """Run a rex command that prints JSON and return the parsed result."""
+    args = list(args)
+    # --json is a rex flag, so it must come before any "-- COMMAND...".
+    at = args.index("--") if "--" in args else len(args)
+    args.insert(at, "--json")
+    proc = subprocess.run([rex, *args], capture_output=True, text=True)
+    if proc.returncode != 0:
+        die(f"rex {' '.join(args)} failed: {proc.stderr.strip()}")
+    try:
+        return json.loads(proc.stdout)
+    except ValueError:
+        die(f"unexpected output from rex {args[0]}: {proc.stdout!r}")
+
+
+def load_cluster(name):
+    path = os.path.expanduser(os.environ.get("REX_CSSH_CONF", "~/.rex-cssh.conf"))
+    try:
+        with open(path) as fh:
+            for line in fh:
+                line = line.split("#", 1)[0].strip()
+                if not line or ":" not in line:
+                    continue
+                key, _, rest = line.partition(":")
+                if key.strip() == name:
+                    return rest.split()
+    except OSError as exc:
+        die(f"cannot read cluster file {path}: {exc}")
+    die(f"cluster '{name}' not found in {path}")
+
+
+def split_host(spec, default_user, default_port):
+    """Return (user, host, port) from '[user@]host[:port]' (and [v6]:port)."""
+    user, port = default_user, default_port
+    if "@" in spec:
+        user, spec = spec.rsplit("@", 1)
+    if spec.startswith("["):  # [::1]:22
+        host, _, rest = spec[1:].partition("]")
+        if rest.startswith(":"):
+            port = rest[1:]
+    elif spec.count(":") == 1:
+        host, port = spec.split(":")
+    else:
+        host = spec
+    return user, host, port
+
+
+def build_ssh(args, spec):
+    user, host, port = split_host(spec, args.user, args.port)
+    cmd = shlex.split(args.ssh)
+    if port:
+        cmd += ["-p", str(port)]
+    if args.identity:
+        cmd += ["-i", args.identity]
+    for opt in args.option:
+        cmd += ["-o", opt]
+    if args.tty and args.remote_cmd:
+        cmd.append("-t")
+    cmd.append(f"{user}@{host}" if user else host)
+    if args.remote_cmd:
+        cmd.append(args.remote_cmd)
+    return cmd, host
+
+
+def grid_shape(n):
+    """Return the number of hosts per row, e.g. 5 -> [3, 2]."""
+    cols = math.ceil(math.sqrt(n))
+    rows = math.ceil(n / cols)
+    return [min(cols, n - r * cols) for r in range(rows)]
+
+
+def launch(args):
+    rex = shutil.which("rex")
+    if not rex:
+        die("'rex' not found in PATH")
+
+    specs = list(args.hosts)
+    if args.cluster:
+        for name in args.cluster.split(","):
+            specs += load_cluster(name)
+    if not specs:
+        die("no hosts given (see --help)")
+
+    targets = [build_ssh(args, s) for s in specs]
+    shape = grid_shape(len(targets))
+    label = args.label or "cssh-" + (args.cluster or targets[0][1]).replace(",", "+")
+
+    if args.dry_run:
+        print(f"layout (hosts per row): {shape}")
+        for cmd, host in targets:
+            print(f"[{host}] {shlex.join(cmd)}")
+        return
+
+    # Rendezvous directory: one unix socket per pane, plus state.json.
+    # (Under /tmp: unix socket paths have a short length limit.)
+    rdir = tempfile.mkdtemp(prefix="rex-cssh-", dir="/tmp")
+
+    def pane_cmd(i):
+        cmd, host = targets[i]
+        return [sys.executable, SELF, "--pane", str(i), "--dir", rdir,
+                "--label", host, "--", *cmd]
+
+    in_session = os.environ.get("REX_SESSION") and not args.new_session
+    created_session = not in_session
+    if in_session:
+        session = os.environ["REX_SESSION"]
+        win = rex_json(rex, "window", "new", "-s", session, label, "--", *pane_cmd(0))
+        window = win["window_id"]
+        first = win["block_ids"][0]
+    else:
+        new = rex_json(rex, "new", label, "--window", label, "--", *pane_cmd(0))
+        session = new["session_id"]
+        window = new["initial_windows"][0].get("window_id")
+        first = new["initial_windows"][0]["block_ids"][0]
+
+    def split(anchor, direction, ratio, i):
+        res = rex_json(rex, "split", "-s", session, "-b", anchor,
+                       f"--split={direction}",
+                       "--ratio", str(max(1, min(99, round(ratio)))),
+                       "--focus=false", "--label", targets[i][1],
+                       "--", *pane_cmd(i))
+        return res["block_ids"][0]
+
+    # Grid: row leaders stacked downwards, then columns to the right of each
+    # leader. Ratios keep every cell the same size.
+    blocks = [None] * len(targets)
+    blocks[0] = first
+    starts = [sum(shape[:r]) for r in range(len(shape))]
+    for r in range(1, len(shape)):
+        remaining = len(shape) - r + 1  # rows shared by the previous leader
+        blocks[starts[r]] = split(blocks[starts[r - 1]], "below",
+                                  100 * (remaining - 1) / remaining, starts[r])
+    for r, cols in enumerate(shape):
+        prev = blocks[starts[r]]
+        for c in range(1, cols):
+            remaining = cols - c + 1
+            i = starts[r] + c
+            blocks[i] = split(prev, "right", 100 * (remaining - 1) / remaining, i)
+            prev = blocks[i]
+
+    state = {
+        "rex": rex,
+        "session": session,
+        "window": window,
+        "created_session": created_session,
+        "blocks": blocks,
+        "labels": [h for _, h in targets],
+    }
+    tmp = os.path.join(rdir, "state.tmp")
+    with open(tmp, "w") as fh:
+        json.dump(state, fh)
+    os.replace(tmp, os.path.join(rdir, "state.json"))
+
+    subprocess.run([rex, "focus", "-s", session, blocks[0]], capture_output=True)
+    where = f"session {session}" if created_session else "this session"
+    print(f"rex-cssh: opened {len(targets)} panes in {where} (tab '{label}')")
+    if created_session:
+        print("rex-cssh: select that session in the Rex app to use it.")
+
+
+# --------------------------------------------------------------------------
+# per-pane pty wrapper
+# --------------------------------------------------------------------------
+
+def write_all(fd, data):
+    while data:
+        n = os.write(fd, data)
+        data = data[n:]
+
+
+def pane(idx, rdir, label, cmd):
+    my_sock = os.path.join(rdir, f"{idx}.sock")
+    sock = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+    sock.bind(my_sock)
+    out = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+    out.settimeout(0.5)
+
+    pid, master = pty.fork()
+    if pid == 0:
+        try:
+            os.execvp(cmd[0], cmd)
+        except OSError as exc:
+            print(f"rex-cssh: cannot run {cmd[0]}: {exc}")
+            os._exit(127)
+
+    def sync_size(*_):
+        try:
+            size = fcntl.ioctl(0, termios.TIOCGWINSZ, b"\0" * 8)
+            fcntl.ioctl(master, termios.TIOCSWINSZ, size)
+        except OSError:
+            pass
+
+    signal.signal(signal.SIGWINCH, sync_size)
+    sync_size()
+
+    broadcast = True
+    state_cache = {}
+
+    def state():
+        if not state_cache:
+            try:
+                with open(os.path.join(rdir, "state.json")) as fh:
+                    state_cache.update(json.load(fh))
+            except (OSError, ValueError):
+                pass
+        return state_cache
+
+    def tell(payload):
+        for path in glob.glob(os.path.join(rdir, "*.sock")):
+            if path == my_sock:
+                continue
+            try:
+                out.sendto(payload, path)
+            except OSError:
+                pass  # peer already gone
+
+    def relabel():
+        st = state()
+        if not st:
+            return
+        suffix = "" if broadcast else " [solo]"
+        for blk, name in zip(st["blocks"], st["labels"]):
+            subprocess.Popen([st["rex"], "block", "rename", "-s", st["session"],
+                              blk, name + suffix],
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+    def quit_all():
+        st = state()
+        if not st:
+            return
+        shutil.rmtree(rdir, ignore_errors=True)  # we're about to be killed
+        if st["created_session"]:
+            subprocess.run([st["rex"], "kill", st["session"]], capture_output=True)
+        else:
+            subprocess.run([st["rex"], "window", "close", "-s", st["session"],
+                            st["window"]], capture_output=True)
+
+    old = termios.tcgetattr(0)
+    tty.setraw(0)
+    stdin_open = True
+    try:
+        while True:
+            rlist = [master, sock] + ([0] if stdin_open else [])
+            ready, _, _ = select.select(rlist, [], [])
+
+            if master in ready:
+                try:
+                    data = os.read(master, 65536)
+                except OSError:
+                    break  # child closed the pty
+                if not data:
+                    break
+                write_all(1, data)
+
+            if sock in ready:
+                msg = sock.recv(CHUNK + 16)
+                if msg[:1] == b"D":
+                    if broadcast:
+                        write_all(master, msg[1:])
+                elif msg[:1] == b"B":
+                    broadcast = msg[1:2] == b"1"
+
+            if 0 in ready:
+                data = os.read(0, 4096)
+                if not data:
+                    stdin_open = False
+                    continue
+                if data[:1] == PREFIX and len(data) <= 2:
+                    key = data[1:2]
+                    if not key:
+                        select.select([0], [], [])
+                        key = os.read(0, 1)
+                    if key == b"t":
+                        broadcast = not broadcast
+                        tell(b"B1" if broadcast else b"B0")
+                        relabel()
+                        continue
+                    if key == b"q":
+                        quit_all()
+                        continue
+                    data = PREFIX if key == b"]" else b""
+                if not data:
+                    continue
+                write_all(master, data)
+                if broadcast:
+                    for i in range(0, len(data), CHUNK):
+                        tell(b"D" + data[i:i + CHUNK])
+    finally:
+        termios.tcsetattr(0, termios.TCSADRAIN, old)
+        try:
+            os.unlink(my_sock)
+        except OSError:
+            pass
+
+    try:
+        _, status = os.waitpid(pid, 0)
+        code = os.waitstatus_to_exitcode(status)
+    except ChildProcessError:
+        code = 0
+    if code != 0:
+        # Keep the pane readable so connection errors can be seen.
+        print(f"\r\n[rex-cssh] {label}: exited with status {code}. Press Enter to close.")
+        try:
+            sys.stdin.readline()
+        except (OSError, KeyboardInterrupt):
+            pass
+
+    # Last pane out cleans up the rendezvous directory.
+    if not glob.glob(os.path.join(rdir, "*.sock")):
+        shutil.rmtree(rdir, ignore_errors=True)
+
+
+# --------------------------------------------------------------------------
+
+def main():
+    ap = argparse.ArgumentParser(
+        prog="rex-cssh",
+        description="Cluster SSH in Rex panes; typing in any pane goes to all.",
+        epilog="Keys in any pane: Ctrl-] t (toggle broadcast), q (quit), ] (literal Ctrl-]).",
+    )
+    ap.add_argument("hosts", nargs="*", metavar="[user@]host[:port]")
+    ap.add_argument("-c", "--cluster", help="cluster name(s) from the config file, comma separated")
+    ap.add_argument("-u", "--user", help="default ssh user")
+    ap.add_argument("-p", "--port", help="default ssh port")
+    ap.add_argument("-i", "--identity", help="ssh identity file")
+    ap.add_argument("-o", "--option", action="append", default=[], metavar="OPT",
+                    help="ssh -o option (repeatable)")
+    ap.add_argument("-x", "--remote-cmd", metavar="CMD", help="command to run on each host")
+    ap.add_argument("-t", "--tty", action="store_true", help="force a tty (-t) when using -x")
+    ap.add_argument("-l", "--label", help="tab/session label (default cssh-<cluster|host>)")
+    ap.add_argument("-n", "--new-session", action="store_true",
+                    help="create a new Rex session even when run inside one")
+    ap.add_argument("--ssh", default="ssh", help="ssh command to use (default: ssh)")
+    ap.add_argument("-d", "--dry-run", action="store_true", help="print what would run")
+    ap.add_argument("--pane", type=int, help=argparse.SUPPRESS)
+    ap.add_argument("--dir", help=argparse.SUPPRESS)
+
+    # Internal mode: `--pane N --dir D --label L -- CMD...`. Split off the
+    # command by hand so its own flags (e.g. ssh -p) are never parsed here.
+    argv = sys.argv[1:]
+    if "--pane" in argv and "--" in argv:
+        cut = argv.index("--")
+        args = ap.parse_args(argv[:cut])
+        pane(args.pane, args.dir, args.label or "", argv[cut + 1:])
+    else:
+        launch(ap.parse_args(argv))
+
+
+if __name__ == "__main__":
+    main()
